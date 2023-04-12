@@ -26,6 +26,17 @@ Data data[NUM_NODES]; // Data of nodes
 int nodeIndex; // Index of this node
 unsigned long lastSendTime; // Last time a packet was sent
 unsigned long lastRecvTime; // Last time a packet was received
+// Define the pin for the built-in led
+#define LED_PIN 2
+
+// Define the duration of the led pulse in microseconds
+#define LED_PULSE 1000
+
+// Define the extra fixed offset for the led pulse in microseconds
+#define LED_OFFSET 100
+
+// Declare a variable for the last led pulse time
+unsigned long lastLedTime;
 
 // Declare functions
 void setupWiFi(); // Set up WiFi connection
@@ -419,6 +430,8 @@ void setup() {
   Serial.begin(115200); // Start serial communication at 115200 baud rate
   setupWiFi(); // Set up WiFi connection
   setupData(); // Set up initial data values
+  pinMode(LED_PIN, OUTPUT); // Set the led pin as output
+  lastLedTime = 0; // Initialize the last led pulse time to 0
 }
 
 // Loop function
@@ -430,4 +443,15 @@ void loop() {
   adjustFreq(); // Adjust global frequency and slot number
   kalmanFilter(); // Apply Kalman filter to estimate timer error and noise level
   correctTimer(); // Correct timer value based on timer error and noise level
+
+  // Flash built-in led with short pulse at the global frequency, offset by sum of packet sending slots plus short extra fixed offset to not interference with any packet sending slot
+  unsigned long currentTime = micros(); // Get current time in microseconds
+  unsigned long interval = (unsigned long) (1000000.0 / data[nodeIndex].globalFreq); // Calculate interval between pulses in microseconds
+  unsigned long offset = (unsigned long) (interval * (data[nodeIndex].slotNum + NUM_NODES) / NUM_NODES + LED_OFFSET); // Calculate offset for this node's pulse in microseconds
+  if (currentTime - lastLedTime >= interval + offset) { // If enough time has passed since last pulse
+    lastLedTime = currentTime; // Update last pulse time
+    digitalWrite(LED_PIN, HIGH); // Turn on the led
+    delayMicroseconds(LED_PULSE); // Wait for the pulse duration
+    digitalWrite(LED_PIN, LOW); // Turn off the led
+    }
 }

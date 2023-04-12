@@ -172,9 +172,6 @@ void reportDiagnostics() {
   Serial.println(WSL);
   Serial.print("WNL: ");
   Serial.println(WNL);
-Okay, I will continue the code.
-
-```c++
   Serial.print("CPL: ");
   Serial.println(CPL);
   Serial.print("EPL: ");

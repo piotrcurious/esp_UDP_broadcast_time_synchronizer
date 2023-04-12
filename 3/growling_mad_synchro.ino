@@ -148,11 +148,30 @@ void updateVariables() {
 }
 
 void updateKalmanFilter() {
-  // TODO: Define the kalman filter model and update ETE and MN based on KFM data
+  // A simple function that updates the kalman filter model based on packet data
+  // Assuming that the state vector is ETE and the observation vector is PAT
+  // And that the system dynamics and measurement process are linear and time-invariant
+  A = 1; // Set the state transition matrix element to 1
+  B = -GNPSF; // Set the control input matrix element to -GNPSF
+  C = 1; // Set the observation matrix element to 1
+  Q = 0.01; // Set the process noise covariance matrix element to a small value
+  R = MN; // Set the measurement noise covariance matrix element to MN
+  P = P + Q; // Predict the error covariance matrix element
+  K = P * C / (C * P * C + R); // Calculate the kalman gain matrix element
+  ETE = ETE + K * (PAT - C * ETE); // Update the estimated timer error
+  P = (1 - K * C) * P; // Update the error covariance matrix element
 }
 
 void updateGradientDescent() {
-  // TODO: Define the cost function and update OTS and TV based on gradient descent data
+  // A simple function that updates the gradient descent algorithm based on packet data
+  // Assuming that the cost function is J = RTT^2 + PAT^2 and the variables are OTS and TV
+  // And that the learning rate parameter is a small positive value
+  alpha = 0.001; // Set the learning rate parameter to a small value
+  J = sq(RTT) + sq(PAT); // Calculate the cost function value
+  dJ_dOTS = 2 * RTT * (-GNPSF) + 2 * PAT * (-GNPSF); // Calculate the partial derivative of the cost function with respect to OTS
+  dJ_dTV = 2 * RTT * (1) + 2 * PAT * (0); // Calculate the partial derivative of the cost function with respect to TV
+  OTS = OTS - alpha * dJ_dOTS; // Update the optimal time slot
+  TV = TV - alpha * dJ_dTV; // Update the timer value
 }
 
 void pulseLED() {

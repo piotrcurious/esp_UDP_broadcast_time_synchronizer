@@ -196,9 +196,33 @@ void reportDiagnostics() {
 }
 
 float estimatePacketLoss(int WSL, int WNL) {
-  // TODO: Define a function that estimates the packet loss rate based on WSL and WNL
+  // A simple function that estimates the packet loss rate based on WSL and WNL
+  // Assuming that the packet loss rate is proportional to the difference between WSL and WNL
+  // And that the packet loss rate is bounded between 0 and 1
+  float PLR = (WNL - WSL) / 100.0; // Calculate the packet loss rate
+  if (PLR < 0) PLR = 0; // Set the lower bound to 0
+  if (PLR > 1) PLR = 1; // Set the upper bound to 1
+  return PLR; // Return the packet loss rate
 }
 
 float estimateMeasurementNoise(int WSL, int WNL, int CPL, float EPL, float ETE, float RTT, float PAT) {
-  // TODO: Define a function that estimates the measurement noise based on WSL, WNL, CPL, EPL, ETE, RTT, and PAT
+  // A simple function that estimates the measurement noise based on WSL, WNL, CPL, EPL, ETE, RTT, and PAT
+  // Assuming that the measurement noise is a weighted sum of the variances of each variable
+  // And that the weights are arbitrary constants that can be tuned
+  float wWSL = 0.1; // Weight for WSL variance
+  float wWNL = 0.1; // Weight for WNL variance
+  float wCPL = 0.2; // Weight for CPL variance
+  float wEPL = 0.2; // Weight for EPL variance
+  float wETE = 0.2; // Weight for ETE variance
+  float wRTT = 0.1; // Weight for RTT variance
+  float wPAT = 0.1; // Weight for PAT variance
+  float MN = 0; // Initialize the measurement noise
+  MN += wWSL * sq(WSL); // Add the WSL variance
+  MN += wWNL * sq(WNL); // Add the WNL variance
+  MN += wCPL * sq(CPL); // Add the CPL variance
+  MN += wEPL * sq(EPL); // Add the EPL variance
+  MN += wETE * sq(ETE); // Add the ETE variance
+  MN += wRTT * sq(RTT); // Add the RTT variance
+  MN += wPAT * sq(PAT); // Add the PAT variance
+  return MN; // Return the measurement noise
 }

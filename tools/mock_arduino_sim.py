@@ -38,9 +38,9 @@ class KalmanPeerFilter:
     def __init__(self):
         self.phaseUs = 0.0
         self.driftUsPerSec = 0.0
-        self.P = [[1e6, 0.0], [0.0, 1e4]]
-        self.Q = [[1.0, 0.0], [0.0, 0.01]]
-        self.R = 2000.0
+        self.P = [[1e7, 0.0], [0.0, 1e5]]
+        self.Q = [[0.1, 0.0], [0.0, 0.0001]]
+        self.R = 1000.0
         self.lastUpdateUs = 0
 
     def predict(self, nowUs):
@@ -69,7 +69,7 @@ class KalmanPeerFilter:
         self.P[1][0] -= K1 * P00; self.P[1][1] -= K1 * P01
 
     def quality(self):
-        uncertainty = math.sqrt(abs(self.P[0][0])) + math.sqrt(abs(self.P[1][1])) * 50.0
+        uncertainty = math.sqrt(abs(self.P[0][0])) + math.sqrt(abs(self.P[1][1])) * 100.0
         return (1.0 / (1.0 + uncertainty / 1000.0))
 
 class NTPNode:
@@ -77,7 +77,7 @@ class NTPNode:
         self.node_id = node_id
         self.num_nodes = num_nodes
         self.drift = 1.0 + (drift_ppm / 1_000_000.0)
-        self.phase_offset = random.uniform(-1_000_000, 1_000_000) # Reduced initial offset for testing stability
+        self.phase_offset = random.uniform(-1_000_000, 1_000_000)
         self.localPhaseUs = 0.0
         self.localDriftUsPerSec = 0.0
         self.localQuality = 0.0
@@ -95,6 +95,8 @@ class NTPNode:
         return self.rawTimeUs(real_time_ms) - self.localPhaseUs
 
     def step(self, real_time_ms, network):
+        self.localPhaseUs += self.localDriftUsPerSec * 0.001
+
         nowUs = self.rawTimeUs(real_time_ms)
         if real_time_ms - self.lastPollMs >= 1000:
             self.txSequence += 1
@@ -108,7 +110,7 @@ class NTPNode:
             src = pkt['src']
             if pkt['type'] == 'POLL':
                 if src not in self.peers:
-                    self.peers[src] = {'active': True, 'filter': KalmanPeerFilter(), 'lastHeardMs': real_time_ms, 'avgRTTUs': 0.0, 'advPhase': pkt['advPhase'], 'advDrift': pkt['advDrift'], 'advQuality': pkt['advQuality']}
+                    self.peers[src] = {'active': True, 'filter': KalmanPeerFilter(), 'lastHeardMs': real_time_ms, 'avgRtt': 0.0, 'varRtt': 0.0, 'advPhase': pkt['advPhase'], 'advDrift': pkt['advDrift'], 'advQuality': pkt['advQuality']}
                 p = self.peers[src]
                 p['active'] = True; p['lastHeardMs'] = real_time_ms; p['advPhase'] = pkt['advPhase']; p['advDrift'] = pkt['advDrift']; p['advQuality'] = pkt['advQuality']
                 self.pendingReplies.append({'target': src, 'poll': pkt, 'rxUs': nowUs, 'sendAtUs': nowUs + 1500 + random.uniform(0, 2000)})
@@ -120,10 +122,15 @@ class NTPNode:
                         T1, T2, T3, T4 = t1Us, pkt['t2'], pkt['t3'], nowUs
                         thetaUs = ((T2 - T1) + (T3 - T4)) * 0.5
                         delayUs = max(0, (T4 - T1) - (T3 - T2))
-                        if delayUs > 100000: continue
-                        p['filter'].predict(nowUs); p['filter'].update(p['advPhase'] - thetaUs, 2000.0 + delayUs)
-                        if p['avgRTTUs'] == 0: p['avgRTTUs'] = delayUs
-                        else: p['avgRTTUs'] = p['avgRTTUs'] * 0.9 + delayUs * 0.1
+                        if delayUs > 50000: continue
+                        if p['avgRtt'] == 0:
+                            p['avgRtt'] = delayUs
+                            p['varRtt'] = delayUs * 0.1
+                        else:
+                            diff = delayUs - p['avgRtt']
+                            p['avgRtt'] += 0.1 * diff
+                            p['varRtt'] = 0.9 * p['varRtt'] + 0.1 * diff * diff
+                        p['filter'].predict(nowUs); p['filter'].update(p['advPhase'] - thetaUs, 1000.0 + delayUs + math.sqrt(p['varRtt'])*5)
 
         rem_replies = []
         for r in self.pendingReplies:
@@ -134,24 +141,25 @@ class NTPNode:
         self.pendingReplies = rem_replies
 
         if real_time_ms - self.lastKfTimeMs >= 100:
-            dt = (real_time_ms - self.lastKfTimeMs) / 1000.0
             self.lastKfTimeMs = real_time_ms
             weightedPhase = 0.0; weightedDrift = 0.0; totalWeight = 0.0
             for pid, p in self.peers.items():
                 if not p['active'] or (real_time_ms - p['lastHeardMs'] > 20000): p['active'] = False; continue
-                weight = p['filter'].quality() * (p['advQuality'] + 0.1) / (1.0 + p['avgRTTUs'] / 1000.0)
+                weight = p['filter'].quality() * (p['advQuality'] + 0.1) / (1.0 + p['avgRtt'] / 500.0)
                 weightedPhase += p['filter'].phaseUs * weight; weightedDrift += p['filter'].driftUsPerSec * weight; totalWeight += weight
             if totalWeight > 1e-6:
                 weightedPhase /= totalWeight; weightedDrift /= totalWeight
                 diff = weightedPhase - self.localPhaseUs
-                self.localPhaseUs += 0.02 * diff
-                self.localDriftUsPerSec += 0.005 * (weightedDrift - self.localDriftUsPerSec)
+                if abs(diff) > 200000: self.localPhaseUs = weightedPhase; self.localDriftUsPerSec = weightedDrift
+                else:
+                    # Stabilized FLL
+                    self.localDriftUsPerSec += 0.02 * (weightedDrift - self.localDriftUsPerSec) + 0.01 * diff
                 self.localQuality = min(1.0, totalWeight)
-            else: self.localQuality = 0
-            self.localPhaseUs += self.localDriftUsPerSec * dt
+            else:
+                self.localQuality = 0
         return self.networkTimeUs(real_time_ms) / 1000.0
 
-def run_simulation(num_nodes=4, duration_s=300):
+def run_simulation(num_nodes=4, duration_s=600):
     network = Network()
     network.num_nodes = num_nodes
     nodes = [NTPNode(i, num_nodes, drift_ppm=random.uniform(-50, 50)) for i in range(num_nodes)]
@@ -163,9 +171,9 @@ def run_simulation(num_nodes=4, duration_s=300):
     return history
 
 if __name__ == "__main__":
-    print("Running Stability NTP Simulation...")
-    history = run_simulation()
+    print("Running Version 7.3 Stability Simulation...")
+    history = run_simulation(duration_s=600)
     num_nodes = len(history[0])
     for i in range(1, num_nodes):
-        diffs = [h[i] - h[0] for h in history[-50000:]]
+        diffs = [h[i] - h[0] for h in history[-100000:]]
         print(f"Node {i} vs Node 0: Mean diff = {sum(diffs)/len(diffs):.2f}ms, Max abs = {max(abs(d) for d in diffs):.2f}ms")

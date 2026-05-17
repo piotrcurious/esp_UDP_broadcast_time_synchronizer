@@ -1,15 +1,16 @@
 /*
  * ============================================================
- * ESP-UDP-SYNC: High-Performance Distributed Clock Synchronization
+ * ESP-UDP-SYNC: Precision Distributed Clock Synchronization
  * ============================================================
- * Version 6.0 - Precision & Consensus Stability
+ * Version 7.3 - Production Grade Stability
  *
  * Key Features:
  * - NTP-style 4-timestamp exchange for RTT & Offset estimation.
  * - Per-peer 2D Kalman Filters for Phase & Drift tracking.
- * - Quality-weighted Consensus: Nodes trust well-synced peers more.
- * - Precision Clock Discipline: PI-controller for stable convergence.
- * - Collision Avoidance: TDMA with randomized slot jitter.
+ * - Continuous Phase Integration (FLL): Clock slews smoothly.
+ * - Overflow Protection: True 64-bit microsecond tracking for ESP8266.
+ * - Jitter-Aware Kalman: dynamic measurement noise R.
+ * - Quality-Weighted Consensus.
  * ============================================================
  */
 
@@ -40,9 +41,9 @@
 #define TX_WINDOW_MS 5
 
 // Kalman Filter constants - Stability-centric
-#define KF_Q_PHASE 1.0
-#define KF_Q_DRIFT 0.001
-#define KF_R_BASE 2000.0
+#define KF_Q_PHASE 0.1
+#define KF_Q_DRIFT 0.0001
+#define KF_R_BASE 1000.0
 
 // ── Types ──────────────────────────────────────────────────────
 enum PacketType : uint8_t { PKT_POLL = 1, PKT_REPLY = 2 };
@@ -70,8 +71,8 @@ struct KalmanFilter {
 
   KalmanFilter() {
     phase = 0; drift = 0; lastUpdateUs = 0;
-    P[0][0] = 1e6; P[0][1] = 0;
-    P[1][0] = 0; P[1][1] = 1e4;
+    P[0][0] = 1e7; P[0][1] = 0;
+    P[1][0] = 0; P[1][1] = 1e5;
   }
 
   void predict(uint64_t nowUs) {
@@ -111,11 +112,12 @@ struct Peer {
   uint32_t lastHeard;
   KalmanFilter filter;
   double avgRtt;
+  double varRtt;
   double advPhase;
   double advDrift;
   float advQuality;
 
-  Peer(uint8_t _id) : id(_id), active(false), lastHeard(0), filter(), avgRtt(0), advPhase(0), advDrift(0), advQuality(0) {}
+  Peer(uint8_t _id) : id(_id), active(false), lastHeard(0), filter(), avgRtt(0), varRtt(0), advPhase(0), advDrift(0), advQuality(0) {}
 };
 
 // ── Global State ──────────────────────────────────────────────
@@ -128,13 +130,23 @@ double localPhase = 0;
 double localDrift = 0;
 float localQuality = 0;
 uint32_t lastKfTime = 0;
+uint32_t lastSlewTime = 0;
+
+// 64-bit microsecond tracking for ESP8266
+#if defined(ESP8266)
+uint32_t lastMicrosLow = 0;
+uint32_t microsHigh = 0;
+#endif
 
 // ── Helpers ───────────────────────────────────────────────────
 uint64_t getRawMicros() {
 #if defined(ESP32)
   return (uint64_t)esp_timer_get_time();
 #else
-  return (uint64_t)micros();
+  uint32_t m = micros();
+  if (m < lastMicrosLow) microsHigh++;
+  lastMicrosLow = m;
+  return ((uint64_t)microsHigh << 32) | m;
 #endif
 }
 
@@ -172,9 +184,16 @@ void handleReply(SyncPacket& pkt, uint64_t rxTime) {
   uint64_t nowUs = getRawMicros();
   int64_t T1 = (int64_t)pkt.t1; int64_t T2 = (int64_t)pkt.t2; int64_t T3 = (int64_t)pkt.t3; int64_t T4 = (int64_t)rxTime;
   double theta = (double)((T2 - T1) + (T3 - T4)) * 0.5; double rtt = (double)((T4 - T1) - (T3 - T2));
-  if (rtt < 0 || rtt > 100000) return;
-  p.filter.predict(nowUs); p.filter.update(p.advPhase - theta, KF_R_BASE + rtt);
-  if (p.avgRtt == 0) p.avgRtt = rtt; else p.avgRtt = p.avgRtt * 0.9 + rtt * 0.1;
+  if (rtt < 0 || rtt > 50000) return;
+
+  if (p.avgRtt == 0) { p.avgRtt = rtt; p.varRtt = rtt*0.1; }
+  else {
+    double diff = rtt - p.avgRtt;
+    p.avgRtt += 0.1 * diff;
+    p.varRtt = 0.9 * p.varRtt + 0.1 * diff * diff;
+  }
+  p.filter.predict(nowUs);
+  p.filter.update(p.advPhase - theta, KF_R_BASE + rtt + sqrt(p.varRtt)*5.0);
 }
 
 void setup() {
@@ -183,22 +202,34 @@ void setup() {
   uint8_t mac[6]; WiFi.macAddress(mac); myId = mac[5];
 #if defined(ESP8266)
   udp.beginMulticast(WiFi.localIP(), IPAddress(224, 0, 0, 1), UDP_PORT);
+  lastMicrosLow = micros();
 #else
   udp.beginMulticast(IPAddress(224, 0, 0, 1), UDP_PORT);
 #endif
-  lastKfTime = millis();
+  lastKfTime = millis(); lastSlewTime = millis();
 }
 
 void loop() {
-  uint32_t now = millis(); uint64_t netUs = getNetworkMicros();
+  uint32_t now = millis();
+
+  uint32_t slewDtMs = now - lastSlewTime;
+  if (slewDtMs > 0) {
+    localPhase += localDrift * (slewDtMs / 1000.0);
+    lastSlewTime = now;
+  }
+
+  uint64_t netUs = getNetworkMicros();
   uint32_t frame = (uint32_t)(netUs / (SUPERFRAME_MS * 1000ULL));
+  uint32_t mySlotIndex = myId % MAX_NODES;
   uint32_t myJitter = (myId * 13) % (TDMA_SLOT_MS / 2);
-  uint64_t mySlotStart = (uint64_t)frame * SUPERFRAME_MS * 1000ULL + (uint64_t)(myId % MAX_NODES) * TDMA_SLOT_MS * 1000ULL + (uint64_t)myJitter * 1000ULL;
+  uint64_t mySlotStart = (uint64_t)frame * SUPERFRAME_MS * 1000ULL + (uint64_t)mySlotIndex * TDMA_SLOT_MS * 1000ULL + (uint64_t)myJitter * 1000ULL;
+
   if (frame != lastPollFrame && netUs >= mySlotStart && (netUs - mySlotStart) < TX_WINDOW_MS * 1000ULL) {
     SyncPacket pkt; pkt.type = PKT_POLL; pkt.srcId = myId; pkt.dstId = 0xFF; pkt.seq = txSeq++; pkt.t1 = getRawMicros();
     pkt.advPhase = localPhase; pkt.advDrift = localDrift; pkt.advQuality = localQuality;
     sendPacket(pkt, IPAddress(224,0,0,1)); lastPollFrame = frame;
   }
+
   int sz; int packetsRead = 0;
   while ((sz = udp.parsePacket()) >= (int)sizeof(SyncPacket) && packetsRead < 10) {
     SyncPacket pkt; udp.read((uint8_t*)&pkt, sizeof(SyncPacket));
@@ -206,23 +237,26 @@ void loop() {
     if (pkt.type == PKT_POLL) handlePoll(pkt, rxTime); else if (pkt.type == PKT_REPLY) handleReply(pkt, rxTime);
     packetsRead++;
   }
+
   if (now - lastKfTime >= 100) {
-    double dt = (double)(now - lastKfTime) / 1000.0; lastKfTime = now;
+    lastKfTime = now;
     double weightedPhase = 0, weightedDrift = 0, totalWeight = 0;
     for (auto& p : peers) {
       if (!p.active || (now - p.lastHeard > 20000)) { p.active = false; continue; }
-      double w = p.filter.quality() * (p.advQuality + 0.1) / (1.0 + p.avgRtt / 1000.0);
+      double w = p.filter.quality() * (p.advQuality + 0.1) / (1.0 + p.avgRtt / 500.0);
       weightedPhase += p.filter.phase * w; weightedDrift += p.filter.drift * w; totalWeight += w;
     }
     if (totalWeight > 1e-6) {
       weightedPhase /= totalWeight; weightedDrift /= totalWeight;
       double diff = weightedPhase - localPhase;
-      if (abs(diff) > 200000) { localPhase = weightedPhase; localDrift = weightedDrift; }
-      else { localPhase += 0.05 * diff; localDrift += 0.02 * (weightedDrift - localDrift); }
+      if (fabs(diff) > 200000) { localPhase = weightedPhase; localDrift = weightedDrift; }
+      else {
+        localDrift += 0.02 * (weightedDrift - localDrift) + 0.01 * diff;
+      }
       localQuality = (float)std::min(1.0, totalWeight);
     } else { localQuality = 0; }
-    localPhase += localDrift * dt;
   }
+
   static uint32_t lastDiag = 0;
   if (now - lastDiag >= 5000) { lastDiag = now; Serial.printf("NetTime: %llu, Phase: %.1f, Drift: %.2f, Quality: %.2f\n", getNetworkMicros(), localPhase, localDrift, localQuality); }
 }

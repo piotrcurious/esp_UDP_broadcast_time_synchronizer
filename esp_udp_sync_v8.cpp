@@ -122,9 +122,9 @@
 #define TX_WINDOW_MS          5
 
 // Kalman constants
-#define KF_Q_PHASE            0.1       // µs²/s process noise, phase
-#define KF_Q_DRIFT            0.0001    // (µs/s)²/s process noise, drift
-#define KF_R_BASE             500.0     // µs² base measurement noise
+#define KF_Q_PHASE            10.0      // µs²/s process noise, phase
+#define KF_Q_DRIFT            0.001     // (µs/s)²/s process noise, drift
+#define KF_R_BASE             1000.0    // µs² base measurement noise
 
 // [A] Beacon model
 // 802.11 beacon interval = 100 TU, 1 TU = 1024 µs
@@ -134,9 +134,10 @@
 #define ASYMMETRY_THRESHOLD_US 8000.0  // 8 ms
 
 // [B] Consensus tuning
-#define HUBER_THRESHOLD_US    500.0     // µs: Huber clip point
-#define ANCHOR_QUALITY_BONUS  4.0       // weight multiplier for reference node
+#define HUBER_THRESHOLD_US    5000.0    // µs: Huber clip point
+#define ANCHOR_QUALITY_BONUS  2.0       // weight multiplier for reference node
 #define RTT_WEIGHT_TAU        500.0     // µs: RTT penalty half-power point
+#define MAX_SLEW_DRIFT        5000.0    // µs/s: maximum frequency correction
 
 // ── Packet ─────────────────────────────────────────────────────
 enum PacketType : uint8_t { PKT_POLL = 1, PKT_REPLY = 2 };
@@ -242,6 +243,16 @@ struct KalmanFilter {
     if (S < 1e-9) return;          // numerical guard
     double K0 = P[0][0] / S;
     double K1 = P[1][0] / S;
+
+    // Slew integration guard: if update is huge, maybe we should just jump
+  if (fabs(y) > 100000.0) {
+        phase = z;
+        // Reset covariance on big jump
+        P[0][0] = 1e7; P[1][1] = 1e5;
+        P[0][1] = P[1][0] = 0;
+        return;
+    }
+
     phase += K0 * y;
     drift += K1 * y;
 
@@ -402,8 +413,10 @@ void handleReply(SyncPacket& pkt, uint64_t rxTime) {
   double rtt      = fwdDelay + revDelay;
   double theta    = (fwdDelay - revDelay) * 0.5;  // NTP offset estimator
 
-  // Sanity: ignore improbable round-trips
-  if (fwdDelay < 0 || revDelay < 0 || rtt > 100000.0) return;
+  // Sanity: ignore improbable round-trips.
+  // Note: fwdDelay and revDelay can be negative due to clock offset,
+  // but RTT should always be positive and reasonable.
+  if (rtt < 0 || rtt > 100000.0) return;
 
   // [A3] Maintain per-direction EWMAs
   if (!p.dirInit) {
@@ -443,9 +456,17 @@ void handleReply(SyncPacket& pkt, uint64_t rxTime) {
   //  + 0.5 × σ²_bcn (beacon residual affects both legs; NTP halves it)
   //  + asymmetry inflation term
   double R = KF_R_BASE
-           + sqrt(p.varRtt) * 5.0
+           + sqrt(fabs(p.varRtt)) * 5.0
            + beaconTracker.residualVariance() * 0.5
            + rInflate;
+
+  // Bootstrap: if this is the first update from any peer and we are not synced,
+  // we can snap our local phase to it.
+  if (localQuality < 0.05 && p.advQuality > 0.05) {
+      localPhase = pkt.advPhase - theta;
+      localQuality = 0.5; // High initial boost to trust the first peer
+      localDrift = p.advDrift; // Also inherit drift for faster lock
+  }
 
   // Kalman update with z = what localPhase should be, from this peer:
   //   peer's network time = peer_raw − peer.advPhase
@@ -468,30 +489,45 @@ void handleReply(SyncPacket& pkt, uint64_t rxTime) {
 // a single local phase/drift using Huber-robust IRLS with
 // reference-node anchoring.
 void runConsensus(uint64_t nowUs, uint32_t nowMs) {
-
   // Expire silent peers
   for (auto& p : peers)
     if (p.active && (nowMs - p.lastHeard > 20000)) p.active = false;
 
   // [B1] Elect reference anchor: peer with highest advQuality
   uint8_t anchorId      = 0xFF;
-  float   anchorQuality = 0.0f;
+  float   anchorQuality = -1.0f; // Start with negative to pick even 0-quality peers
   for (auto& p : peers) {
     if (!p.active) continue;
     if (p.advQuality > anchorQuality) {
       anchorQuality = p.advQuality;
       anchorId      = p.id;
+    } else if (p.advQuality == anchorQuality && p.id < anchorId) {
+      // Tie-breaker: lowest ID
+      anchorId = p.id;
     }
   }
 
+  // Tie-break with ourselves. If we have better or equal quality than any peer,
+  // we can potentially be the anchor for the network (stability anchor).
+  // Use a slight bias to prefer the network anchor to maintain global consensus.
+  if (localQuality > anchorQuality + 0.05) {
+      anchorId = myId;
+      anchorQuality = localQuality;
+  }
+
+  // If no peers are active, we might be the first node or isolated.
+  // In a decentralized network, the node with the lowest ID (including us)
+  // could act as a virtual anchor to prevent drift of the whole network.
+  // For now, we only anchor to peers.
+
   // Helper: base weight for peer p
-  // [B2] w = filter_quality × advQuality² / (1 + avgRtt/τ)
-  //      advQuality² penalises poorly-synced peers quadratically:
-  //      a peer at advQuality=0.5 gets 25% weight vs a fully synced one.
+  // [B2] w = filter_quality × (advQuality + 0.1)² / (1 + avgRtt/τ)
+  //      Adding 0.1 ensures bootstrap works when everyone has 0 quality.
+  //      The square penalises poorly-synced peers quadratically:
+  //      a peer at advQuality=0.5 gets ~25% weight vs a fully synced one.
   auto baseWeight = [&](const Peer& p) -> double {
-    double q = (double)p.filter.quality()
-             * (double)p.advQuality
-             * (double)p.advQuality;
+    double qAdv = (double)p.advQuality + 0.1;
+    double q = (double)p.filter.quality() * qAdv * qAdv;
     double w = q / (1.0 + p.avgRtt / RTT_WEIGHT_TAU);
     if (p.id == anchorId) w *= ANCHOR_QUALITY_BONUS;
     return w;
@@ -507,9 +543,18 @@ void runConsensus(uint64_t nowUs, uint32_t nowMs) {
     wDrift1 += p.filter.drift * w;
     wTotal1 += w;
   }
+
+  // Self-contribution to prevent drift if we are already high quality
+  // and have no better peers.
+  if (localQuality > 0.05) {
+      double selfW = (double)localQuality * 1.0; // Weight our own opinion
+      wPhase1 += localPhase * selfW;
+      wDrift1 += localDrift * selfW;
+      wTotal1 += selfW;
+  }
+
   if (wTotal1 < 1e-9) { localQuality = 0.0f; return; }
   double mu0  = wPhase1 / wTotal1;   // initial phase estimate
-  double mu0d = wDrift1 / wTotal1;
 
   // ── [B3] Pass 2: Huber-robust re-weighting ───────────────────
   // Peers whose phase estimate deviates by more than δ from mu0
@@ -525,19 +570,37 @@ void runConsensus(uint64_t nowUs, uint32_t nowMs) {
     wDrift2 += p.filter.drift * w;
     wTotal2 += w;
   }
-  if (wTotal2 < 1e-9) { localQuality = 0.0f; return; }
+
+  // Self-contribution to Pass 2
+  if (localQuality > 0.05) {
+      double selfW = (double)localQuality * 1.0;
+      double r = fabs(localPhase - mu0);
+      if (r > HUBER_THRESHOLD_US) selfW *= HUBER_THRESHOLD_US / r;
+      wPhase2 += localPhase * selfW;
+      wDrift2 += localDrift * selfW;
+      wTotal2 += selfW;
+  }
+
+  if (wTotal2 < 1e-9) {
+      // No consensus possible
+      return;
+  }
   double robustPhase = wPhase2 / wTotal2;
   double robustDrift = wDrift2 / wTotal2;
 
   // ── Fuse into local state ────────────────────────────────────
   double diff = robustPhase - localPhase;
-  if (fabs(diff) > 200000.0) {
+  if (fabs(diff) > 10000.0) {
     // Large discontinuity: snap (e.g. cold start or topology change)
     localPhase = robustPhase;
     localDrift = robustDrift;
   } else {
     // Smooth slew: drift integrates phase error + tracks consensus drift
-    localDrift += 0.02 * (robustDrift - localDrift) + 0.01 * diff;
+    // Increased gains for faster convergence
+    localDrift += 0.1 * (robustDrift - localDrift) + 0.1 * diff;
+    // Frequency cap to prevent runaway
+    if (localDrift >  MAX_SLEW_DRIFT) localDrift =  MAX_SLEW_DRIFT;
+    if (localDrift < -MAX_SLEW_DRIFT) localDrift = -MAX_SLEW_DRIFT;
   }
   localQuality = (float)std::min(1.0, wTotal2);
 }
@@ -635,7 +698,7 @@ void loop() {
     Serial.printf(
       "NetTime:%llu  Ph:%.1f  Dr:%.4f  Q:%.2f  Peers:%u  BcnVar:%.0f\n",
       (unsigned long long)getNetworkMicros(),
-      localPhase, localDrift, localQuality,
+      localPhase, localDrift, (double)localQuality,
       (unsigned)peers.size(),
       beaconTracker.residualVariance()
     );

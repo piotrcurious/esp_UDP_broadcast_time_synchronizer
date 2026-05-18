@@ -2,8 +2,7 @@
 #include <queue>
 #include <map>
 
-// Implementations moved to test_v8.cpp or kept here if not redefined
-#ifndef TEST_V8
+#ifndef TEST_V11
 MockSerial Serial;
 MockWiFi WiFi;
 

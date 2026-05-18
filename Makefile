@@ -1,11 +1,16 @@
-CC=g++
-CFLAGS=-I./mock_arduino -Wall -DTEST_V8
-LDFLAGS=-lm
+CC = g++
+CFLAGS = -O3 -I. -Imock_arduino
+SOURCES = mock_arduino/Arduino.cpp
+TARGET_V8 = test_v8
+TARGET_V11 = test_v11
 
-all: test_v8
+all: $(TARGET_V8) $(TARGET_V11)
 
-test_v8: mock_arduino/test_v8.cpp esp_udp_sync_v8.cpp mock_arduino/Arduino.cpp
-	$(CC) $(CFLAGS) mock_arduino/test_v8.cpp -o test_v8 $(LDFLAGS)
+$(TARGET_V8): mock_arduino/test_v8.cpp $(SOURCES)
+	$(CC) $(CFLAGS) mock_arduino/test_v8.cpp -o $(TARGET_V8)
+
+$(TARGET_V11): mock_arduino/test_v11.cpp $(SOURCES)
+	$(CC) $(CFLAGS) mock_arduino/test_v11.cpp -o $(TARGET_V11)
 
 clean:
-	rm -f test_v8
+	rm -f $(TARGET_V8) $(TARGET_V11)

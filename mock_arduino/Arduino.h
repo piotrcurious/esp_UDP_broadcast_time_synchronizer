@@ -79,10 +79,10 @@ public:
         currentPacket.insert(currentPacket.end(), buffer, buffer + size);
         return size;
     }
-    int endPacket();
-    int parsePacket();
-    int read(uint8_t* buffer, size_t size);
-    IPAddress remoteIP();
+    virtual int endPacket();
+    virtual int parsePacket();
+    virtual int read(uint8_t* buffer, size_t size);
+    virtual IPAddress remoteIP();
 };
 
 #endif
